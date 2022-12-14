@@ -6,7 +6,7 @@ import numpy as np
 from typing import Optional
 import torch.nn.functional as F
 
-from unet_blocks import *
+from unet import *
 
 
 def drop_path_f(x, drop_prob: float = 0., training: bool = False):
@@ -371,7 +371,6 @@ class SwinTransformerBlock(nn.Module):
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-
         return x
 
 
@@ -478,7 +477,7 @@ class Swin_Unet(nn.Module):
 
     def __init__(self, input_channels=1, patch_size=2, embed_dim=48, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
                  window_size=7, mlp_ratio=4, qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, patch_norm=True, num_classes=4, num_filters=[48, 96, 192, 384],
+                 norm_layer=nn.LayerNorm, patch_norm=True, num_classes=4, num_filters=[48, 96, 192, 384, 768],
                  apply_last_layer=True, padding=True, use_checkpoint=False):
         super(Swin_Unet, self).__init__()
         self.padding = padding
@@ -496,7 +495,7 @@ class Swin_Unet(nn.Module):
         # decoder通道数
         self.num_filters = num_filters
         # stage4输出特征矩阵的channels
-        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.num_features = int(embed_dim * 2 ** (self.num_layers))
         self.mlp_ratio = mlp_ratio
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -526,54 +525,61 @@ class Swin_Unet(nn.Module):
                                 use_checkpoint=use_checkpoint)
             self.swin_layers.append(layers)
 
+        self.norm = norm_layer(self.num_features)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Linear(self.num_features, 4 * 4 * self.num_features) if num_classes > 0 else nn.Identity()
+
+        self.apply(self._init_weights)
+
         # decoder部分
         self.upsampling_path = nn.ModuleList()
 
         n = len(self.num_filters) - 1
-        output = self.num_filters[-1]
-        for i in range(n, -1, -1):
-            if i == n:
-                input = output + self.num_filters[i]
-            else:
-                input = self.num_filters[i] * 2
-            output = self.num_filters[i]
-            self.upsampling_path.append(UpConvBlock(input, output, padding, bilinear=False))
+        for i in range(n, 0, -1):
+            input = self.num_filters[i]
+            self.upsampling_path.append(UpBlock(input))
 
+        self.last_layer = nn.ModuleList()
         if self.apply_last_layer:
-            self.last_layer = []
-            self.last_layer.append(UpConvBlock(output * 2, output, padding, bilinear=True))
-            self.last_layer.append(nn.Conv2d(output, num_classes, kernel_size=1))
+            self.last_layer.append(nn.ConvTranspose2d(self.num_filters[0], self.num_filters[0], kernel_size=2, stride=2))
+            self.last_layer.append(nn.Conv2d(self.num_filters[0], num_classes, kernel_size=1))
 
-            # nn.init.kaiming_normal_(self.last_layer.weight, mode='fan_in',nonlinearity='relu')
-            # nn.init.normal_(self.last_layer.bias)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, val):
+    def forward(self, x):
         blocks = []
-        input = nn.Conv2d(x.shape[1], self.num_filters[0], kernel_size=1).to("cuda")(x)
         # swin block encoder
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
+        input = x.view(x.shape[0], x.shape[-1], H, W)
         blocks.append(x.view(x.shape[0], H, W, x.shape[-1]))
         for i, stage in enumerate(self.swin_layers):
             x, H, W = stage(x, H, W)
             if i != len(self.swin_layers) - 1:
                 blocks.append(x.view(x.shape[0], H, W, x.shape[-1]))
 
-        # unet decoder
-        x = x.view(x.shape[0], H, W, x.shape[-1]).permute(0, 3, 1, 2)
-        for i, up in enumerate(self.upsampling_path):
-            x = up(x, blocks[-i - 1].permute(0, 3, 1, 2))
+        x = self.norm(x)
+        x = self.avgpool(x.transpose(1, 2))  # [B, C, 1]
+        x = torch.flatten(x, 1)
+        x = self.head(x)
 
+        # unet decoder
+        x = x.view(x.shape[0], H, W, self.num_features).permute(0, 3, 1, 2)
+        for i, up in enumerate(self.upsampling_path):
+            x_cat = blocks[-i - 1].permute(0, 3, 1, 2)
+            x = up(x, x_cat)
         del blocks
 
-        # Used for saving the activations and plotting
-        if val:
-            self.activation_maps.append(x)
-
         if self.apply_last_layer:
-            x = self.last_layer[0].to("cuda")(x, input)
-            x = self.last_layer[1].to("cuda")(x)
-
+            x = self.last_layer[0](x)
+            x = self.last_layer[1](x)
         return x
 
 
@@ -581,13 +587,13 @@ def swin_tiny_patch4_window7_224(num_classes: int = 1000, **kwargs):
     # trained ImageNet-1K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth
     model = Swin_Unet(in_chans=1,
-                            patch_size=4,
-                            window_size=7,
-                            embed_dim=96,
-                            depths=(2, 2, 6, 2),
-                            num_heads=(3, 6, 12, 24),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=7,
+                      embed_dim=96,
+                      depths=(2, 2, 6, 2),
+                      num_heads=(3, 6, 12, 24),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -595,13 +601,13 @@ def swin_small_patch4_window7_224(num_classes: int = 1000, **kwargs):
     # trained ImageNet-1K
     # https://github.com/Swin_Unet/storage/releases/download/v1.0.0/swin_small_patch4_window7_224.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=7,
-                            embed_dim=96,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(3, 6, 12, 24),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=7,
+                      embed_dim=96,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(3, 6, 12, 24),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -609,13 +615,13 @@ def swin_base_patch4_window7_224(num_classes: int = 1000, **kwargs):
     # trained ImageNet-1K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window7_224.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=7,
-                            embed_dim=128,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(4, 8, 16, 32),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=7,
+                      embed_dim=128,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(4, 8, 16, 32),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -623,13 +629,13 @@ def swin_base_patch4_window12_384(num_classes: int = 1000, **kwargs):
     # trained ImageNet-1K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window12_384.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=12,
-                            embed_dim=128,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(4, 8, 16, 32),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=12,
+                      embed_dim=128,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(4, 8, 16, 32),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -637,13 +643,13 @@ def swin_base_patch4_window7_224_in22k(num_classes: int = 21841, **kwargs):
     # trained ImageNet-22K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window7_224_22k.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=7,
-                            embed_dim=128,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(4, 8, 16, 32),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=7,
+                      embed_dim=128,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(4, 8, 16, 32),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -651,13 +657,13 @@ def swin_base_patch4_window12_384_in22k(num_classes: int = 21841, **kwargs):
     # trained ImageNet-22K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window12_384_22k.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=12,
-                            embed_dim=128,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(4, 8, 16, 32),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=12,
+                      embed_dim=128,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(4, 8, 16, 32),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -665,13 +671,13 @@ def swin_large_patch4_window7_224_in22k(num_classes: int = 21841, **kwargs):
     # trained ImageNet-22K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_large_patch4_window7_224_22k.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=7,
-                            embed_dim=192,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(6, 12, 24, 48),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=7,
+                      embed_dim=192,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(6, 12, 24, 48),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
 
 
@@ -679,11 +685,11 @@ def swin_large_patch4_window12_384_in22k(num_classes: int = 21841, **kwargs):
     # trained ImageNet-22K
     # https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_large_patch4_window12_384_22k.pth
     model = Swin_Unet(in_chans=3,
-                            patch_size=4,
-                            window_size=12,
-                            embed_dim=192,
-                            depths=(2, 2, 18, 2),
-                            num_heads=(6, 12, 24, 48),
-                            num_classes=num_classes,
-                            **kwargs)
+                      patch_size=4,
+                      window_size=12,
+                      embed_dim=192,
+                      depths=(2, 2, 18, 2),
+                      num_heads=(6, 12, 24, 48),
+                      num_classes=num_classes,
+                      **kwargs)
     return model
